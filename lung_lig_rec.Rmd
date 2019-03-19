@@ -1,0 +1,438 @@
+---
+title: "lung ligans-receptor analysis"
+author: "Dikla Gelbard"
+date: "`r Sys.Date()`"
+output: rmarkdown::html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### In this note we exemplify the Ligand-Receptor analysis as was shown in ([Cohen et al. Cell 2018](https://www.cell.com/cell/pdf/S0092-8674(18)31181-4.pdf)).
+For further questions please contact [Amir Giladi](mailto:amir.goldberg@weizmann.ac.il) or [Dikla Glebard Solodkin](mailto:dikla.gelbard@gmail.com)
+
+## Ligand-Receptor analysis 
+
+## loading Metacell library 
+#### In order to run the following commands you will need mat and mc objects in your database directory and update the following chunk with the correct paths and id's 
+```{r, eval=TRUE, warning=FALSE}
+library("metacell")
+if(!dir.exists("saved_work")) dir.create("saved_work/")
+scdb_init("saved_work/", force_reinit=T)
+tgconfig::override_params("annotations/lung_params.yaml","metacell")
+src_functions = "scripts/mc_modeling_functions.R"
+if(!dir.exists("results")) dir.create("results/")
+scfigs_init("results/")
+if(!dir.exists("results/figure3")) dir.create("results/figure3")
+if(!dir.exists("results/figure3/pairs")) dir.create("results/figure3/pairs")
+if(!dir.exists("results/figure3/pops")) dir.create("results/figure3/pops")
+if(!dir.exists("results/figureS3")) dir.create("results/figureS3")
+if(!dir.exists("results/figureS3/lr_kinetics")) dir.create("results/figureS3/lr_kinetics")
+id = "lung_kinetics_sorted" # here you can update for the name of your MetaCell object
+mat_id = id
+mc_id = id
+```
+
+
+### Interaction map 
+
+#### Building and projecting an interaction graph of ligand-receptor pairs
+
+```{r, eval=TRUE, warning=FALSE}
+#' @param mat_id 
+#' @param mc_id
+#' @param dir_nm
+#' @param fig_fn file name for figure
+#' @param frac_threshold choosing only genes which are expressed in more than 15% of the cells of the maximal metacell  
+#' @param K number of gene modules (for visualiztion)
+#' @param modules_corr_threshold numeric value between 0 to 1, increasing the number affects the density of the graph
+#' @param genes_corr_threshold numeric value between 0 to 1, increasing the number affects the density of the graph in each module
+#' @param jitter_x random range for x axis
+#' @param jitter_y random range for y axis
+
+library(reshape2)
+library(Rgraphviz)
+library(plyr)
+lig_rec_map <- function(mat_id, mc_id,lig_rec_fn ='annotations/ligand_receptor_mouse.csv' ,fig_nm = "results/figure3/interaction_map.png",frac_threshold = 0.1,
+                        K=15,modules_corr_threshold = 0.55, genes_corr_threshold = 0.3,jitter_x = 35,jitter_y = 35){
+  source(src_functions)
+  # load objects
+  mat = scdb_mat(mat_id)
+  mc = scdb_mc(mc_id)
+  color_key = unique(mc@color_key[,c("group","color")])
+  name2color = color_key$color
+  names(name2color) = color_key$group
+  color2name = color_key$group
+  names(color2name) = color_key$color
+  if(file.exists(paste0(.scdb_base,mat_id,".dus.Rda"))){
+    # loading a downsampled matrix (dus) which was already computed
+    load(paste0(.scdb_base,mat_id,".dus.Rda"))
+  }
+  else{
+    # creating a gene set from the rownames of mat@mat in order to generate a downsampled matrix (dus)
+    all_gene_sets = rep(1,length(rownames(mat@mat)))
+    names(all_gene_sets) = rownames(mat@mat)
+    scdb_add_gset("all_mat_genes",gset_new_gset(all_gene_sets,"all_mat_genes"))
+    set.seed(1436)
+    dus = as.matrix(gset_get_feat_mat(gset_id = "all_mat_genes",mat_id = mat_id,downsamp = T))
+    # removing rows (genes) with zero umi count
+    dus = dus[which(rowSums(dus) !=0),]
+    save(file=paste0(.scdb_base,mat_id,".dus.Rda"),dus)
+  }
+  set.seed(27)
+  # removing columns (cells) which are not in the mc object 
+  dus = dus[,intersect(names(mc@mc),colnames(dus))]
+  # loading ligand receptor table
+  proper=function(x) paste0(toupper(substr(x, 1, 1)), tolower(substring(x, 2)))
+  rec_lig = read.delim(lig_rec_fn, sep = ",", row.names = 1)
+  ligand_receptor = as.matrix(table(rec_lig$ligand,rec_lig$receptor))
+  rownames(ligand_receptor) = unlist(lapply(rownames(ligand_receptor),function(x) proper(x)))
+  colnames(ligand_receptor) = unlist(lapply(colnames(ligand_receptor),function(x) proper(x)))
+  lfp = log2(mc@mc_fp)
+  sigs = intersect(intersect(rownames(lfp),rownames(dus)), union(rownames(ligand_receptor), colnames(ligand_receptor))) # list of relevant ligand receptor genes
+  # filter out low abundance genes
+  mc_mc = mc@mc[intersect(names(mc@mc),colnames(dus))]
+  # m is the matrix of the normalized average of UMI counts for each LR gene (rows) in each metacell (columns) - created from the downsampled UMI count matrix, averaged by metaclles size
+  m = t(apply(dus[sigs,], 1, tapply, mc_mc, sum)) 
+  sizes = table(mc_mc)
+  m = sweep(m,2,as.vector(sizes),"/")*min(sizes) 
+  # define a "maximal metacell" for each gene and calculating in how many cells of this metacell, the gene is expressed 
+  max_m = apply(m,1,max)
+  arg_max_m =  apply(m,1,which.max)
+  count_m = sapply(sigs, function(x) (sum(dus[x,names(mc_mc[mc_mc == arg_max_m[x]])] >0)/sizes[arg_max_m[x]]))
+  png("results/max_avg_m_vs_count_m_ds.png")
+  plot(log2(max_m),count_m,col = mc@colors[arg_max_m],xlab="maximal normalized averaged log2 umi count of a gene in a metacell",ylab = "fraction of cells with at least one molecule of the gene in the maximal metacell")
+  abline(h = frac_threshold)
+  dev.off()
+  names(count_m) = sigs
+  if(file.exists("saved_work/bad_marks.Rda")){
+    load("saved_work/bad_marks.Rda")
+  } 
+  else{
+    bad_marks = c()
+  }
+  # filter out genes that are expressed in only less than frac_threshold of the cells in their "maximal metacell"
+  genes = setdiff(names(which(count_m >  frac_threshold)),bad_marks) # filtered list of relevant ligand receptor genes
+  # creating a data frame of ligand-recptor pairs from the filtered gene list 
+  ligands = intersect(genes, rownames(ligand_receptor)); receptors = setdiff(genes, ligands)
+  rec_lig_2 = melt(ligand_receptor)
+  colnames(rec_lig_2) = c("ligand", "receptor", "interaction")
+  rec_lig_2[,1] = as.vector(rec_lig_2[,1]); rec_lig_2[,2] = as.vector(rec_lig_2[,2])
+  rec_lig_3 = rec_lig_2[ rec_lig_2[,1] %in% ligands & rec_lig_2[,2] %in% receptors & rec_lig_2[,3] == 1,]
+  # choosing highly variable genes for each metacell
+  nms = choose_genes_from_mc(mc,mat, nms_per_mc=15,bad_genes = c(bad_marks,setdiff(rownames(mc@mc_fp),rownames(dus))),nms_thresh = 2)
+  genes = union(ligands, receptors)
+  all_genes = union(nms, genes)
+  gene_set = rep(1,length(all_genes))
+  names(gene_set) = all_genes
+  # calculting correlation between genes (list contains ligands, receptors and other significant genes) according to the downsampled umi counts matrix
+  # running hierarchical clustring on this correlation matrix 
+  feat = dus
+  k_nonz_exp = tgconfig::get_param("scm_k_nonz_exp",package = "metacell")
+  feat = log2(1+k_nonz_exp*as.matrix(feat))
+  feat_cor = tgstat::tgs_cor(t(as.matrix(feat)[all_genes,]),spearman = TRUE)
+  hc = hclust(as.dist(1-feat_cor), "ward.D2")
+  ct = cutree(hc, K)
+  C = feat_cor
+  m = apply(as.matrix(feat)[all_genes,], 2, tapply, ct, sum)
+  corr_modules = cor(t(log(1 + m)), method = "spearman")
+  C3 = corr_modules
+  C3[ C3 < modules_corr_threshold] = 0
+  N = nrow(C3)
+  # drawing the interactions graph, N nodes for each genes module
+  rEG <- new("graphNEL", nodes=as.character(1:N), edgemode="undirected")
+  e = which(C3 > 0) # edges between similar modules 
+  n1 = ceiling((e)/N) # node1 in the edge
+  n2 = 1+((e-1) %% N) # node2 in the edge
+  # drawing edges between modules
+  rEG = addEdge(as.character(n1[n1!=n2]), as.character(n2[n1!=n2]), rEG, C3[e[n1!=n2]])
+  g = layoutGraph(rEG, layoutType="neato")
+  x_cl = nodeRenderInfo(g)$nodeX # getting x position of each module
+  y_cl = nodeRenderInfo(g)$nodeY # getting y position of each module
+  names(x_cl) = rownames(C3)
+  names(y_cl) = rownames(C3)
+  # right now we have positions for the centers of each genes module, now we would like to draw each gene  
+  C2 = C; C2[ C2 < genes_corr_threshold] = 0
+  C2 = C2 / rowSums(C2)
+  # choosing positions for each gene according to similarity 
+  x = apply(C2, 1, function(z) sum(z[z > 0 ] * x_cl[ ct[ names(which(z > 0))]])) + runif(nrow(C2),-jitter_x,jitter_x)
+  y = apply(C2, 1, function(z) sum(z[z > 0] * y_cl[ ct[ names(which(z > 0))]])) + runif(nrow(C2),-jitter_y,jitter_y)
+  gene_coords = cbind(x,y)
+  rownames(gene_coords) = all_genes
+  IM = lfp[all_genes, ]
+  wmax = rep(NA, length(all_genes)); names(wmax) = all_genes
+  # for each gene, chossing the cell type with its maxmial expression levels
+  mean_lfp = tapply(1:length(mc@colors),color2name[mc@colors],function(x) {
+    if(is.vector(IM[,as.integer(x)])){return(list(IM[,as.integer(x)]))}
+    else{ return(list(rowMeans(IM[,as.integer(x)])))}})
+  mean_lfp = as.data.frame(mean_lfp)
+  wmax[rownames(IM)] = colnames(mean_lfp)[apply(mean_lfp, 1, which.max)]
+  # display only ligands and receptors genes
+  gene_coords = gene_coords[genes,]
+  wmax = wmax[genes]
+  # plotting the interaction map
+  png(fig_nm, height = 2000, width = 2000)
+  par(mar=c(5,20,5,0),xpd=TRUE)
+  plot(gene_coords[,1], gene_coords[,2], type = "n", axes = F, xlab = "", ylab = "")
+  # plot segments (edges) between pairs of ligand-receptor with interaction
+  with(rec_lig_3[ rec_lig_3$ligand %in% genes & rec_lig_3$receptor %in% genes,], 
+       segments(gene_coords[ligand,1], gene_coords[ligand,2], gene_coords[receptor,1], gene_coords[receptor,2], lwd = 1.5,col = "gray60")) 
+  # plot points for each gene, color them by the cell type of the identified metacell
+  points(gene_coords[,1], gene_coords[,2], pch = 21, cex = 4, lwd = 4,
+         bg  = ifelse(rownames(gene_coords) %in% ligands, name2color[wmax], "white"), 
+         col = ifelse(rownames(gene_coords) %in% ligands, "black", name2color[wmax]))
+  legend(min(gene_coords[,1])-55,max(gene_coords[,2]) + 15,legend = c("ligand","receptor"), pch=21,pt.lwd = 1,cex = 3,pt.bg=c("gray","white"),box.lwd = 0,bg=NA,pt.cex = 4,title = "LR type",title.adj = 0)
+  legend(min(gene_coords[,1])-55,max(gene_coords[,2]) - 25,legend = names(name2color),pch = 21,pt.lwd = 1,cex=3,pt.bg=as.character(name2color),box.lwd = 0,bg=NA,pt.cex = 4,title = "Cell type",title.adj = 0)
+  dev.off()
+  
+  write.table(ligands, row.names = F, quote = F, col.names = F, file = "results/expressed_ligands.txt")
+  write.table(receptors, row.names = F, quote = F, col.names = F, file = "results/expressed_receptors.txt")
+  return(list(gene_coords,rec_lig_3,ligands,receptors,wmax,dus))
+}
+```
+
+
+```{r, eval=TRUE, warning=FALSE}
+tgconfig::override_params("annotations/lung_params.yaml","metacell")
+l = lig_rec_map(mat_id = id,mc_id = id,fig_nm = "results/figure3/interaction_map.png")
+gene_coords = l[[1]]
+rec_lig_3 = l[[2]]
+ligands = l[[3]]
+receptors = l[[4]]
+wmax = l[[5]]
+dus = l[[6]]
+save(file = "saved_work/lig_rec_vars.Rda",gene_coords,rec_lig_3,ligands,receptors,wmax,dus)
+```
+
+```{r, eval=TRUE,echo = FALSE, warning=FALSE}
+load("saved_work/lig_rec_vars.Rda")
+```
+
+The ligand-receptor map of lung development pooled across all time points. Genes (ligands and receptors) were projected on a 2D map based on their correlation structure 
+![interaction map](results/figure3/interaction_map.png){width=1000px}
+
+
+###  Immune vs Non-immune interaction map
+```{r, eval=TRUE, echo=TRUE, warning=FALSE}
+tgconfig::override_params("annotations/lung_params.yaml","metacell")
+mat = scdb_mat(id)
+load("saved_work/lig_rec_vars.Rda")
+genes = union(ligands,receptors)
+m = t(apply(dus[genes,], 1, tapply, as.vector(mat@cell_metadata[colnames(dus), "sorting.scheme"]), sum))
+sizes = table(as.vector(mat@cell_metadata[colnames(dus), "sorting.scheme"]))
+m = sweep(m,2,as.vector(sizes),"/") * min(sizes)
+z = (m[,2] + 10) / (m[,1] + 10)
+si_class = ifelse(abs(log2(z)) > 1, ifelse(log2(z) > 0, "immune", "stroma"), "both") # annotate each gene with its identified cell type (immune vs stroma)
+si_col = c("gray", "green3", "red2")
+png("results/figureS3/si_specificity.png", height=1000, width=1000)
+par(mar=c(5,5,5,5))
+lim = c(log2(10), max(c(log2(m[,1] + 10), log2(m[,2] + 10))))
+plot(log2(m[,1] + 10), log2(m[,2] + 10), pch = 21, cex = 2, bg = si_col[ as.numeric(factor(si_class))], 
+	axes = F, xlab = "Non immune", ylab = "Immune", xlim = lim, ylim = lim, cex.lab =2)
+abline(coef = c(1,1), lty=2, lwd = 2); abline(coef = c(-1,1), lty=2, lwd=2)
+axis(1,cex.axis = 2); axis(2,cex.axis = 2)
+dev.off()
+
+png("results/figure3/interaction_si.png", height = 1500, width = 1500)
+par(mar=c(3,20,3,0),xpd=TRUE)
+plot(gene_coords[,1], gene_coords[,2], type = "n", axes = F, xlab = "", ylab = "")
+with(rec_lig_3[ rec_lig_3$ligand %in% genes & rec_lig_3$receptor %in% genes & rec_lig_3$interaction == 1,],
+	segments(gene_coords[ligand,1], gene_coords[ligand,2], gene_coords[receptor,1], gene_coords[receptor,2], lwd = 1.5,
+       	col = "gray60"))
+points(gene_coords[,1], gene_coords[,2], pch = 21, cex = 4, lwd = 4,
+	bg  = ifelse(rownames(gene_coords) %in% ligands, si_col[as.numeric(factor(si_class))], "white"),
+       	col = ifelse(rownames(gene_coords) %in% ligands, "black", si_col[as.numeric(factor(si_class))]))
+legend(min(gene_coords[,1])-85,max(gene_coords[,2]) + 10,legend = c("ligand","receptor"), pch=21,pt.lwd = 1,cex = 3,pt.bg=c("gray","white"),box.lwd = 0,bg=NA,title = "LR type",title.adj = 0)
+legend(min(gene_coords[,1])-85,max(gene_coords[,2]) - 50,legend = c("Non-immune","Immune","Non-specific"),pch = 21,pt.lwd = 1,cex=3,pt.bg=c("red2","green3","gray"),box.lwd = 0,bg=NA,title = "Niche specificity",title.adj = 0)
+dev.off()
+```
+
+Projection of genes activated in the immune (green) and non-immune (red) compartments.   
+Full and empty circles represent ligands and receptors, respectively. Gray circles represent ligand/receptors non-specific to one compartment.   
+![Projection of genes activated in the immune (green) and non-immune (red) compartments](results/figure3/interaction_si.png){width=1000px}
+
+
+Differential expression of `r length(gene_coords[,1])` LR genes between the non-immune (red, x axis) and immune (green, y axis) compartments.   
+Compartment specificity is determined by two-fold change threshold. LR which are not specific for immune or stromal compartment are marked in gray circles.  
+
+![Compartment specificity](results/figureS3/si_specificity.png)
+
+To identify important cellular communication hubs involved in a large number of interactions between and within compartments, we examined LR expression patterns across different cell types.  
+In this chunk we calculate the fold change of each gene for each cell type, if it is higher than 2 we include the gene in the interaction map of the cell type.  
+```{r, eval=TRUE, warning=FALSE}
+library(reshape2)
+source(src_functions)
+load("saved_work/lig_rec_vars.Rda")
+genes = union(ligands,receptors)
+disp_genes = c("Met","Robo2", "Wnt5a","Sdc2","Tgfb3","Il33","Areg", "Sftpa1","Icam1","Sdc1","Cgn","Cd4","Tnfsf11","Cd247","Il17f","Chad","Il22","Csf2","Il18r1","Il2ra","Il18rap","Il1rl1","Csf2ra", "Csf2rb","Ccl6","Ccl9","Il6","C3ar1","Ccl4","Il6","Il4","Csf1","Hgf","L1cam","Il13","Ccl24","C1qb","Ccl7","Pf4","C3ar1","Sirpa","Ccl3","Csf1r","Tnf","C3ar1","Il6ra","Csf2rb","Spp1")
+lin_ord = c("Endothel","Fibro","Matrix","Smooth","Pericytes","Epithel","AT1","AT2","Club","Ciliated","MacI","MacII","MacIII","Mon","Neut", "Baso", "Mast","DC","B", "T", "ILC","NK")
+pop_fc = matrix(NA, nrow = length(genes), ncol = length(lin_ord), dimnames = list(genes, lin_ord))
+mc = scdb_mc(id)
+color_key = unique(mc@color_key[,c("group","color")])
+name2color = color_key$color
+names(name2color) = color_key$group
+color2name = color_key$group
+names(color2name) = color_key$color
+short_list = rec_lig_3[ rec_lig_3$ligand %in% genes & rec_lig_3$receptor %in% genes & rec_lig_3$interaction == 1,]
+for (pop in lin_ord) {
+	g1 = intersect(colnames(dus),names(mc@mc[which(as.character(color2name[mc@colors[mc@mc]]) == pop)]))
+	g2 = setdiff( intersect(colnames(dus),names(mc@mc)), g1)
+	x = rowSums(dus[genes,g2]) / length(g2) * min(length(g1), length(g2))
+	y = rowSums(dus[genes,g1]) / length(g1) * min(length(g1), length(g2))
+	z = log2((10 + y) / (10 + x))
+	spec_genes = names(which(z > 1))
+	pop_fc[,pop] = z
+	all_int = rec_lig_3[ (rec_lig_3$ligand %in% spec_genes | rec_lig_3$receptor %in% spec_genes) & rec_lig_3$interaction == 1, 1:2]
+	all_genes = intersect(rownames(gene_coords), as.vector(as.matrix(all_int)))
+	png(paste0("results/figure3/pops/", pop, ".png"), height = 1200, width = 1200)
+        plot(gene_coords[,1], gene_coords[,2], type = "n", axes = F, xlab = "", ylab = "")
+        points(gene_coords[,1], gene_coords[,2], pch = 20, cex = 2, lwd = 2.5, col = "gray80")
+	with(short_list[ short_list$ligand %in% spec_genes | short_list$receptor %in% spec_genes,],
+                segments(gene_coords[ligand,1], gene_coords[ligand,2], gene_coords[receptor,1], gene_coords[receptor,2], lwd = 1.5, col = "gray60"))
+        points(gene_coords[all_genes,1], gene_coords[all_genes,2], pch = 21, cex = 6, lwd = 6,
+                bg  = ifelse(all_genes %in% ligands, ifelse(all_genes %in% spec_genes, name2color[pop], "gray60"), "white"),
+                col = ifelse(all_genes %in% ligands, "black", ifelse(all_genes %in% spec_genes, name2color[pop], "gray40")))
+	dev.off()
+
+	sub_genes = intersect(spec_genes,disp_genes)
+	print(paste(pop,max(z)))
+	png(paste0("results/figure3/pops/", pop, "_text.png"), height = 1000, width = 1000)
+        plot(gene_coords[,1], gene_coords[,2], type = "n", axes = F, xlab = "", ylab = "")
+        with(short_list[ short_list$ligand %in% spec_genes | short_list$receptor %in% spec_genes,],
+                segments(gene_coords[ligand,1], gene_coords[ligand,2], gene_coords[receptor,1], gene_coords[receptor,2], lwd = 1.5, col = "gray60"))
+	points(gene_coords[all_genes,1], gene_coords[all_genes,2], pch = 21, cex = 6, lwd = 4,
+                bg  = ifelse(all_genes %in% ligands, ifelse(all_genes %in% spec_genes, name2color[pop], "gray60"), "white"),
+                col = ifelse(all_genes %in% ligands, "gray20", ifelse(all_genes %in% spec_genes, name2color[pop], "gray40")))
+        if (length(sub_genes) > 0) {
+		text(gene_coords[sub_genes,1], gene_coords[sub_genes,2], sub_genes, cex = 3, col = "black",adj = c(0.5,1.2))
+	}
+  dev.off()
+}
+
+# Generating a table of all found interactions between lung cell types
+tps = factor(mat@cell_metadata[names(mc@mc),"kinetic.group"], levels = c("E12.5", "E16.5", "E_late", "P_early", "P_mid", "P_d2", "P_d7"))
+names(tps) = names(mc@mc)
+comb = paste0(color2name[mc@colors[as.integer(mc@mc)]], "@", tps)
+names(comb) = names(mc@mc)
+m = sc_to_bulk(mat_id = id, comb = comb, choose_genes=F, min_comb = 9)
+pops = unlist(lapply(sapply(colnames(m), strsplit, "@"), "[[", 1))
+pop_tps = unlist(lapply(sapply(colnames(m), strsplit, "@"), "[[", 2))
+short_list = short_list[,1:3]
+pop_melt = melt(pop_fc)
+pop_melt = pop_melt[ pop_melt$value > 1,]
+short_list_2 = merge(short_list, pop_melt, by.x="ligand", by.y = "Var1")
+short_list_3 = merge(short_list_2, pop_melt, by.x="receptor", by.y = "Var1")
+colnames(short_list_3) = c("receptor", "ligand", "interaction", "transmitter", "transmitter_fc", "responder", "responder_fc")
+short_list_3 = short_list_3[,c(2,1,4,6,5,7)]
+genes = union(short_list_3$ligand, short_list_3$receptor)
+m = m[ genes,]
+mm = melt(m)
+mm$pop = unlist(lapply(sapply(as.vector(mm$Var2), strsplit, "@"), "[[", 1))
+mm$tp = unlist(lapply(sapply(as.vector(mm$Var2), strsplit, "@"), "[[", 2))
+mm$id = paste0(mm$Var1, "@", mm$pop)
+mm2 = mm[,c(6,5,3)]
+m2 = dcast(mm2, id ~ factor(tp, levels = levels(tps)))
+m3 = as.data.frame(m2[,-1]); rownames(m3) = m2[,1]
+
+short_list_3$lid = paste0(short_list_3$ligand, "@", short_list_3$transmitter)
+short_list_3$rid = paste0(short_list_3$receptor, "@", short_list_3$responder)
+short_list_4 = merge(short_list_3, m3, by.x = "lid", by.y = 0)
+colnames(short_list_4)[9:15] = paste0("ligand-", colnames(short_list_4)[9:15])
+short_list_5 = merge(short_list_4, m3, by.x = "rid", by.y = 0)
+colnames(short_list_5)[16:22] = paste0("receptor-", colnames(short_list_5)[16:22])
+short_list_5 = short_list_5[,-(1:2)]
+write.table(short_list_5, sep = "\t", row.names = F, quote = F, file = "results/figureS3/all_interctions.txt")
+```
+
+
+### ligand-receptor pairs
+```{r, eval=TRUE, warning=FALSE}
+tgconfig::override_params("annotations/lung_params.yaml","metacell")
+library(scales)
+lig_rec_fn = 'annotations/ligand_receptor_mouse.csv'
+proper=function(x) paste0(toupper(substr(x, 1, 1)), tolower(substring(x, 2)))
+rec_lig = read.delim(lig_rec_fn, sep = ",", row.names = 1)
+ligand_receptor = as.matrix(table(rec_lig$ligand,rec_lig$receptor))
+rownames(ligand_receptor) = unlist(lapply(rownames(ligand_receptor),function(x) proper(x)))
+colnames(ligand_receptor) = unlist(lapply(colnames(ligand_receptor),function(x) proper(x)))
+
+mc = scdb_mc(id)
+mc2d = scdb_mc2d(id)
+mat = scdb_mat(id)
+color_key = unique(mc@color_key[,c("group","color")])
+name2color = color_key$color
+names(name2color) = color_key$group
+color2name = color_key$group
+names(color2name) = color_key$color
+lin_ord = c("Endothel","Fibro","Matrix","Smooth","Pericytes","Epithel","AT1","AT2","Club","Ciliated","MacI","MacII","MacIII","Mon","Neut", "Baso", "Mast","DC","B", "T", "ILC","NK")
+lfp = log2(mc@mc_fp)
+sigs = intersect(intersect(rownames(lfp),rownames(dus)), union(rownames(ligand_receptor), colnames(ligand_receptor))) # list of relevant ligand receptor genes
+ligands = intersect(sigs, rownames(ligand_receptor)); receptors = setdiff(sigs, ligands)
+rec_lig_2 = melt(ligand_receptor)
+colnames(rec_lig_2) = c("ligand", "receptor", "interaction")
+rec_lig_2[,1] = as.vector(rec_lig_2[,1]); rec_lig_2[,2] = as.vector(rec_lig_2[,2])
+rec_lig_3 = rec_lig_2[ rec_lig_2[,1] %in% ligands & rec_lig_2[,2] %in% receptors & rec_lig_2[,3] == 1,c(1,2)]
+rownames(rec_lig_3) = paste0(rec_lig_3$ligand,"_",rec_lig_3$receptor)
+genes = union(rec_lig_3$ligand,rec_lig_3$receptor)
+mc_mc = mc@mc[intersect(colnames(dus),names(mc@mc))]
+m = t(apply(dus[genes,], 1, tapply, color2name[mc@colors[mc_mc]], sum))
+sizes = table(color2name[mc@colors[mc_mc]])
+m = sweep(m,2,as.vector(sizes),"/") * min(sizes)
+q = 9
+pairs = c("Csf1_Csf1r")
+
+seq10 = seq(0,1,length.out = 10)
+gb_mat = outer(seq10, seq10, function(x,y) sqrt(x^2 + y ^2))
+rownames(gb_mat) = seq10; colnames(gb_mat) = seq10
+gb_mat = melt(gb_mat)
+colnames(gb_mat)  = c("green", "blue", "gb_norm")
+gb_mat$col = ifelse(gb_mat$gb_norm >0.1, hsv(h = ifelse(gb_mat$gb_norm > 0, 0.25 * gb_mat$green / gb_mat$gb_norm, 0), s = pmax(gb_mat$green,gb_mat$blue), v = 1 - 0.5*gb_mat$green - 0.5*gb_mat$blue), "white")
+
+for(pair in pairs){
+  lig = strsplit(pair,split = "_")[[1]][1]
+  rec = strsplit(pair,split = "_")[[1]][2]
+  a = mat@mat[lig,]
+  b = mat@mat[rec,]
+  norm_a = rep(0, length(a)); names(norm_a) = names(a)
+  norm_a[ a != 0] = as.numeric(cut(a[ a != 0], unique(quantile(a[ a != 0], (0:q)/q)), include.lowest = T)) + 1;
+  norm_b = rep(0, length(b)); names(norm_b) = names(b)
+  norm_b[ b != 0] = as.numeric(cut(b[ b != 0], unique(quantile(b[ b != 0], (0:q)/q)), include.lowest = T)) + 1;
+  green = norm_a / max(norm_a); blue = norm_b / max(norm_b)
+  gb_norm = sqrt(green^2 + blue^2)
+  cols = ifelse(gb_norm >0.1, hsv(h = ifelse(gb_norm > 0, 0.25 * green / gb_norm, 0), s = pmax(green,blue), v = 1 - 0.5*green - 0.5*blue), "white")
+  exp_cells = names(which(a > 0 | b > 0))
+  pt_cex = 1 + 0.4 * round((pmax(norm_a, norm_b) - 1) / max(norm_a) * 5)
+  png(paste0("results/figure3/pairs/", lig, "-", rec, ".png"), height = 1000, width = 1000)
+  layout(matrix(c(1,2,3,4),nrow =2,ncol=2,byrow = TRUE),width = c(200,800,300,700),height=c(700,300))
+  top_left_marg=c(5,3,40,1)
+  par(mar=top_left_marg)
+  image(matrix(1:100, nrow = 10), col = gb_mat$col,axes=F)
+  arrows(-0.1,-0.1,-0.1,0.5,xpd=TRUE)
+  arrows(-0.1,-0.1,0.5,-0.1,xpd=TRUE)
+  mtext("Receptor",side=2,adj=0,line = 1)
+  mtext("Ligand",side=1,adj=0,line = 1)
+  top_right_marg =c(0,1,1,1)
+  par(mar=top_right_marg)
+  # plot(mc2d@sc_x, mc2d@sc_y, pch = 8, col = alpha(mc@colors[mc@mc[names(mc2d@sc_x)]],alpha = 0.4), cex=1, axes = F, xlab = "", ylab = "")
+  plot(mc2d@sc_x, mc2d@sc_y, pch = 8, col = "gray80", cex=1, axes = F, xlab = "", ylab = "")
+  points(mc2d@sc_x[exp_cells], mc2d@sc_y[exp_cells], cex = pt_cex[exp_cells],pch = 21,bg = cols[exp_cells],lwd = 1.5)
+  legend_marg = c(1,1,1,1)
+  par(mar=legend_marg, font = 2)
+  plot(NULL ,xaxt='n',yaxt='n',bty='n',ylab='',xlab='', xlim=0:1, ylim=0:1)
+  legend("center",legend=names(name2color[lin_ord]),title = "Cell types colors", text.font = 1,	pch=19, cex=1.5,col=as.character(name2color[lin_ord]),ncol = 2, bty='n')
+  bottom_marg = c(3,2,3,1)
+  par(mar=bottom_marg,lwd=3,cex = 1.2)
+  ylim = c(floor(-max(m[rec,])), ceiling(max(m[lig,])))
+  barplot(m[lig,lin_ord ], col = name2color[lin_ord], names.arg="", ylab = "", ylim = ylim, axes = F)
+  barplot(-m[rec,lin_ord],  col = name2color[lin_ord], names.arg="", add = T, axes = F)
+  axis(2, at = c(ylim[1], 0, ylim[2]),las =2,font=2)
+  mtext(lig,side=3,adj = 0.5,line = 1.2,col = "#408000",cex = 2,font=2)
+  mtext(rec,side=1,adj = 0.5,line= 1.2, col = "#800000",cex = 2,font=2)
+	dev.off()
+}
+
+```
+Dual projection of the ligand Csf1 (green) and its unique receptor Csf1r (red) on the single cell map from Figure 1.  
+Colors indicate expression quantiles. Bar plots indicate ligand and receptor normalized expression per 1,000 UMI across cell types. 
+![ligand receptor dual projection](results/figure3/pairs/Csf1-Csf1r.png){width=1000px}

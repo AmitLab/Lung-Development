@@ -1,0 +1,626 @@
+---
+title: "Lung development single cell analysis = MetaCell modellin"
+author: "Dikla Gelbard Solodkin"
+date: "`r Sys.Date()`"
+output: rmarkdown::html_document
+---
+
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+### In this note we exemplify the application of metacell package to the lung development dataset, obtained using the MARS-seq protocol ([Cohen et al. Cell 2018](https://www.cell.com/cell/pdf/S0092-8674(18)31181-4.pdf)).
+For further questions please contact [Amir Giladi](mailto:amir.goldberg@weizmann.ac.il) or [Dikla Glebard Solodkin](mailto:dikla.gelbard@gmail.com)
+
+## Basic Metacell pipeline
+Load the library, initialize a database and figures directory, define an id for the MetaCell objects
+```{r, eval=TRUE, warning=FALSE}
+library("metacell")
+if(!dir.exists("saved_work")) dir.create("saved_work/")
+scdb_init("saved_work/", force_reinit=T)
+tgconfig::override_params("annotations/lung_params.yaml","metacell")
+src_functions = "scripts/mc_modeling_functions.R"
+if(!dir.exists("results")) dir.create("results/")
+scfigs_init("results/")
+if(!dir.exists("results/figure1")) dir.create("results/figure1")
+index_fn = "annotations/lung_fn.txt"
+id = "lung_kinetics"
+ord_id = "lung_kinetics_sorted"
+```
+
+**force_reinit=T** instruct the system to override existing database objects.  
+This can be important if you are running in cycles and would like to update your objects. Otherwise, the database reuses loaded objects to save time on reading and initializing them from the disk.  
+**tgconfig::override_params()** overrides default metacell configurations.      
+
+
+We will read multiple MARS umi matrices (umi.tab) and merge them, based on a table defining the datasets   
+@param *mat_nm* defines the ID of the matrix object (and is going to be the name of all the objects from now on)    
+@param *base_dir* defines the umitab directory    
+@param *mat_nm* defines the name (id) of matrix    
+@param *datasets_table_fn* defines the index file of the MARS multi batch dataset. This is a tab delimited text file, with an arbitrary number of columns and a header line.    
+The three mandatory fields are:    
+*Amp.Batch.ID* - specify the ID of the batch defined by the row, and also the file name (without the .txt suffix) of the respective umi table in the base_dir provided.    
+*Seq.Batch.ID* - efines and ID of the sequencing batch (may be relevant for further noise cleanups beyond those done in the low-level pipeline).    
+*Batch.Set.ID* - The third id group different batches into sets for downstream analysis (e.g. QC and more).    
+
+Let us take a look at our index file:  
+```{r, eval=TRUE,echo = FALSE,warning=FALSE}
+library(knitr)
+kable(head(read.delim(index_fn)))
+```
+
+Let's load a matrix to the system:  
+```{r, eval=TRUE, warning=FALSE}
+umi.tab_dir = "output/umi.tab/"
+mcell_import_multi_mars(mat_nm = "all", dataset_table_fn = index_fn, base_dir = umi.tab_dir, force = T)
+mat = scdb_mat("all")
+print(dim(mat@mat))
+```
+
+The **scdb_mat()** command returns a matrix object, which has one slot containing the count matrix (mat@mat), as well as additional features we will mention below.  
+
+MetaCell uses a standardized naming scheme for the figures, to make it easier to archive and link analysis figures to the database objects.  
+In principle, figures in the figures directory are named after the object data type they refer to (for example, mat for matrices, mc for metacells, and more, see below).  
+The figure name then includes also the object name they refer to, and a suffix describing the actual figure type.  
+
+### Exploring and filtering the UMI matrix 
+
+To get a basic understanding of the new data, we will plot the distribution of UMI count per cell (the plot is thresholded after 500 umi counts):  
+
+```{r, eval=TRUE, warning=FALSE}
+mcell_plot_umis_per_cell("all",min_umis_cutoff = 500)
+```
+`r sprintf("![Umi distribution plot](%s)", paste0("results/","all",".total_umi_distr.png"))`
+
+
+We want to clean some known issues from the matrix before starting to work with it.  
+We generate a list of mitochondrial genes that typically mark cells as being stressed or dying, as well as immunoglobulin genes that may represent strong clonal signatures in plasma cells, rather than cellular identity.  
+
+```{r, eval=TRUE, warning=FALSE}
+mat = scdb_mat("all")
+ery_genes = c("Hba-a2", "Alas2", "Hba-a1", "Hbb-b2", "Hba-x", "Hbb-b1")
+ery_umis = as.matrix(mat@mat[ery_genes,])
+pool_ery = colSums(ery_umis)
+doublets = read.delim("annotations/doublets.txt",header=FALSE,stringsAsFactor = FALSE)[[1]]
+
+nms = c(rownames(mat@mat), rownames(mat@ignore_gmat))
+ig_genes = c(grep("^Igj", nms, v=T), 
+				grep("^Igh",nms,v=T),
+				grep("^Igk", nms, v=T), 
+				grep("^Igl", nms, v=T))
+bad_genes = unique(c(grep("ERCC|^mt", nms, v=T), ig_genes))
+print(bad_genes)
+```
+
+We will next ask the package to ignore the above genes and ignore erithrocytes:  
+
+```{r, eval=TRUE, warning=FALSE}
+mcell_mat_ignore_genes(new_mat_id=id, mat_id="all", bad_genes, reverse=F) 
+mcell_mat_ignore_cells(new_mat_id=id,mat_id=id,ig_cells=c(names(which(pool_ery>64)),doublets),reverse=FALSE)
+```
+
+Ignored genes are kept in the matrix for reference, but all downstream analysis will disregard them.  
+This means that the number of UMIs from these genes cannot be used to distinguish between cells.  
+
+In the current example we will also eliminate cells with less than 500 UMIs (threshold can be set based on examination of the UMI count distribution):  
+
+```{r, eval=TRUE, warning=FALSE}
+mcell_mat_ignore_small_cells(id, id, 500)
+```
+
+Note that filtering decisions can be iteratively modified given results of the downstream analysis.  
+
+### Selecting feature genes
+
+We move on to computing statistics on the distributions of each gene in the data, which are going to be our main tool for selecting feature genes for MetaCell analysis:  
+
+```{r, eval=TRUE, warning=FALSE}
+set.seed(27)
+mcell_add_gene_stat(gstat_id=id, mat_id=id, force=T)
+```
+
+This generates a new object of type gstat under the name `r paste0("gstat",id)`, by analyzing the count matrix `r paste0("mat",id)`.
+We can explore interesting genes and their distributions:
+
+```{r, eval=TRUE, warning=FALSE}
+gstat = scdb_gstat(id)
+print(head(gstat))
+print(quantile(gstat$ds_vm_norm,c(1:20)/20))
+```
+
+```{r, eval=TRUE, warning=FALSE}
+png("results/hist.gstats.t_vm.png")
+hist(gstat$ds_vm_norm,breaks=c(floor(min(gstat$ds_vm_norm)*10):ceiling(max(gstat$ds_vm_norm)*10))/10,main = "Histogram of downsampled variance divided by mean")
+abline(v=0.3)
+axis(side = 1,at=0.3,labels="0.3")
+dev.off()
+```
+
+```{r, eval=TRUE, warning=FALSE}
+t_vm = 0.3
+```
+![Histogram of ds_vm_norm](results/hist.gstats.t_vm.png)  
+
+
+Selecting a gene set for downstream analysis:    
+We create a new object of type gset (gene set), to which all genes whose scaled variance (variance divided by mean, AKA ds_vm_norm) exceeds a given threshold are added.  
+The command creates a new gene set with all genes for which the scaled variance is higher than `r t_vm`, it also restricts this gene set to genes with at least 50 UMIs across the entire dataset, and also requires selected genes to have at least three cells for more than 4 UMIs were recorded.  
+
+```{r, eval=TRUE, warning=FALSE}
+mcell_gset_filter_multi(gstat_id=id, gset_id=id, T_tot=50, T_top3=4, T_vm = t_vm, force_new = T)
+```
+`r sprintf("Selected %d markers",length(scdb_gset(id)@gene_set))`
+
+We update the gset object by removing a list of irrelevant genes which we don't want them to affect the clustering process:  
+
+```{r, eval=TRUE, warning=FALSE}
+modules = read.csv("annotations/modules_big.csv", stringsAsFactors = F)
+cc_genes = modules[ modules$annotation == "CC", "gene"]
+ribo_genes = modules[ modules$annotation == "Ribo", "gene"]
+other_genes = c("Ccnd2","Cdkn1c","H19","Hmga2","Igf2","Igfbp5","Mdk")
+bad_marks = unique(c(bad_genes,cc_genes, ribo_genes,other_genes, "Malat1", "7SK","Xist", "mmu-mir-689-2", "Atp5g3", "Csta"))
+save(file="saved_work/bad_marks.Rda",bad_marks)
+gset_unfiltered = scdb_gset(id)
+markers_to_keep = setdiff(names(gset_unfiltered@gene_set), bad_marks)
+scdb_del_gset(id)
+tmp = rep(1, length(markers_to_keep)); names(tmp) = markers_to_keep
+new_gset = gset_new_gset(tmp, "ribos filtered out")
+scdb_add_gset(id, new_gset)
+```
+`r sprintf("Selected after filtration %d markers",length(scdb_gset(id)@gene_set))`
+
+We can refine our parameters by plotting all genes and our selected gene set given the mean and variance statistics:  
+
+```{r, eval=TRUE, warning=FALSE}
+mcell_plot_gstats(gstat_id=id, gset_id=id)
+```
+`r sprintf("![var mean plot](%s){width=350px}", paste0("results/",id,".varmin.png"))`
+
+
+### Building the balanced cell graph
+
+Assuming we are happy with the selected genes, we will move forward to create a similarity graph (cgraph), using a construction called balanced K-nn graph:  
+
+```{r, eval=TRUE, warning=FALSE}
+set.seed(27)
+mcell_add_cgraph_from_mat_bknn(mat_id=id,gset_id = id,graph_id=id,K=100,dsamp=T)
+```
+
+This adds to the database a new cgraph object named `r paste0("cgraph.",id)`.  
+The K=100 parameter is important, as it affects the size distribution of the derived metacells.  
+
+The knn procedure creates a graph with all the cells as nodes and weighted edges as a representation of the similiarty strength between pair of cells:  
+```{r, eval=TRUE, warning=FALSE}
+cgraph = scdb_cgraph(id)
+kable(head(cgraph@edges))
+```
+
+### Resampling and generating the co-clustering graph
+
+The next step will use the cgraph to sample five hundred metacell partitions, each covering 75% of the cells and organizing them in dense subgraphs:  
+
+```{r, eval=TRUE, warning=FALSE}
+set.seed(27)
+mcell_coclust_from_graph_resamp(coc_id=id,graph_id=id,min_mc_size=15,p_resamp=0.75, n_resamp=500)
+```
+
+The metacell size distribution of the resampled partitions will be largely determined by the K parameter used for computing the cgraph.  
+The resampling process may take a while if the graphs are very large. You can modify **n_resamp** to generate fewer resamples.
+
+The resampling procedure creates a new coclust object in the database named `r paste0("coclust.",id)`, and stores the number of times each pair of cells ended up being part of the same metacell (the *cnt* column).  
+
+```{r, eval=TRUE, warning=FALSE}
+coclust = scdb_coclust(id)
+kable(head(coclust@coclust))
+```
+
+The co-clustering statistics are used to generate a new similarity graph, based on which accurate calling of the final set of metacells is done:  
+
+```{r, eval=TRUE, warning=FALSE}
+set.seed(27)
+mcell_mc_from_coclust_balanced(coc_id=id,mat_id= id,mc_id= id,K=30, min_mc_size=15, alpha=2)
+```
+
+We created a metacell object `r paste0("mc.",id)` based on analysis of the co-clustering graph.  
+The parameter K determines the number of neighbors we wish to minimally associate with each cell.  
+Prior to partitioning the co-cluster graph is filtered to eliminate highly unbalanced edges, with smaller alpha resulting in harsher filtering.    
+
+### Creating heatmaps of metacells and genes
+
+We will first assign random colors to our clusters (these can later be modified with custom color definitions, e.g. based on cell type assignments).  
+
+```{r, eval=TRUE, warning=FALSE}
+mc<- scdb_mc(id)
+mc@colors <- colorRampPalette(c("darkgray", "burlywood1", "chocolate4","orange", "red", "purple", "blue","darkgoldenrod3", "cyan"))(ncol(mc@mc_fp))
+scdb_add_mc(id,mc)
+mc<- scdb_mc(id)
+```
+
+The metacell object `r paste0("mc.",id)` can now be visualized.  
+In order to do this effectively, we usually go through one or two iterations of selecting informative marker genes.  
+The package can select markers for you automatically - by simply looking for genes that are strongly enriched in any of the metacells:  
+
+```{r,eval=TRUE, warning=FALSE}
+mcell_gset_from_mc_markers(gset_id=paste0(id,"_markers"), mc_id=id)
+mcell_mc_plot_marks(mc_id=id, gset_id=paste0(id,"_markers"), mat_id=id,plot_cells = T)
+```
+
+`r sprintf("![heatmap_marks_mc](%s){width=1000px}", paste0("results/",id,".cells_heat_marks.png"))`
+
+
+### Selecting markers and coloring metacells  
+
+We can take a look on the distribution of gene markers (requires a prior literature review), and generate a colorize table.  
+Assume we have a marker genes table like that:  
+
+```{r, eval=TRUE,echo = FALSE,warning=FALSE}
+library(knitr)
+markers_table = read.delim("annotations/markers.txt")
+kable(head(markers_table))
+```
+
+The values plotted are color coded log2(fold enrichment) and fold enrichment values of the metacell over the median of all other metacells:    
+
+```{r ,eval=TRUE,warning=FALSE}
+mc = scdb_mc(id)
+nx = ceiling(dim(unique(markers_table[,c("name","gene")]))[1]/3)
+ny = 3
+```
+
+```{r ,eval=TRUE,warning=FALSE}
+lfp <- log2(mc@mc_fp)
+png("results/genes_log_distribution.png",w=5500,h=(11000/nx) * ny)
+layout(matrix(1:(nx*ny), nx , ny , byrow=T))
+for(cell_type in unique(markers_table$name)){
+  for(gene in markers_table[markers_table$name == cell_type,"gene"]){
+    par(mar=c(5,4,5,4),xpd=TRUE)
+    cap = paste(cell_type,gene,sep="_")
+    barplot(lfp[gene,],col=mc@colors,las=2,cex.axis=2,ylab="log2FC",xlab="metacells")
+    abline(h=log2(markers_table[markers_table$name == cell_type & markers_table$gene == gene,"T_fold"]))
+    title(main = cap,cex.main=3.6)
+  }
+}
+dev.off()
+```
+![Genes log distribution](results/genes_log_distribution.png){width=1000px} 
+
+
+```{r ,eval=TRUE,echo=FALSE,warning=FALSE}
+png("results/genes_distribution.png",w=5500,h=(11000/nx) * ny)
+layout(matrix(1:(nx*ny), nx , ny , byrow=T))
+for(cell_type in setdiff(unique(markers_table$name),c("contam","MegK","hemato"))){
+  for(gene in markers_table[markers_table$name == cell_type,"gene"]){
+    par(mar=c(5,4,5,4),xpd=TRUE)
+    cap = paste(cell_type,gene,sep="_")
+    barplot(mc@mc_fp[gene,],col=mc@colors,las=2,cex.axis=2,ylab="FC",xlab="metacells")
+    abline(h=markers_table[markers_table$name == cell_type & markers_table$gene == gene,"T_fold"])
+    title(main = cap,cex.main=3.6)
+  }
+}
+dev.off()
+```
+![Genes distribution](results/genes_distribution.png){width=1000px}
+
+
+Using the correct genes and T_fold threshold (the horizontal line in each barplot), as well as priority, is necessary in order to colorize the metacells.     
+There are other methods we can use in order to find the best marker genes (and thresholds).  
+For example,XY plot of the footprint score (*mc@mc_fp*) of each mc in 2 different genes:   
+
+```{r, eval=TRUE,echo = TRUE,warning=FALSE}
+plot_two_genes_fp = function(mc_id, ga, gb, log = T) {
+  mc = scdb_mc(mc_id)
+  fp = mc@mc_fp
+  if (log) {
+    fp = log2(fp)
+  }
+  a = fp[ga,]; b = fp[gb,]
+	plot(a,b, xlab = ga, ylab = gb, pch = 21, cex = 2.5, bg = mc@colors)
+	text(a,b, names(a),cex = 0.8)
+	return(data.frame(a = a, b = b)) 
+}
+
+pairs = list(c("Acta2","Tgfbi"),c("Flt3","Cst3"),c("Flt3","H2-Aa"),c("Ccl5","Gzma"),c("Ccl5","Trbc2"),c("Gzma","Trbc2"),c("Flt3","Ccr2"),c("Cst3","Ccr2"),c("Flt3","Cx3cr1"),c("Cst3","Cx3cr1"),c("Rora","Il7r"))
+if(!dir.exists("results/genes_comp_fc")) dir.create("results/genes_comp_fc/")
+for(pair in pairs){
+  ga = pair[1]; gb = pair[2]
+  png(paste0("results/genes_comp_fc/",ga,"_",gb,".png"))
+  ga_gb_df = plot_two_genes_fp(id,ga,gb,log=F)
+  dev.off()
+}
+```
+In this example we can decide that Tgfbi is a sufficent discrimnator for smooth muscle fibroblast cells  
+![Example gene1 vs gene2](results/genes_comp_fc/Acta2_Tgfbi.png)
+
+
+Finally we can genearte a colorizing table based on marker genes expression.  
+
+Let us take a look at our colorizing table:  
+@column1 *group* the name of the cell type
+@column2 *gene* the name of the marker gene for this cell type (each cell type can have multiple corresponding genes, but each gene can have only one corresponding cell type)
+@column3 *color* the corresponding color for this specific cell type
+@column4 *priority* for cases of passing the threshold in two different cell types:  
+  If a metacell x has high footprint score in two different cell types markers (g1 and g2) (*mc@mc_fp[g1,x] > T_fold1 AND mc@mc_fp[g2,x] > T_fold2*), the gene (and its corresponding cell type) with the higher score weighted by priority is chosen (*max(priority1 $\cdot$ log2(mc@mc_fp[g1,x]),priority2 $\cdot$ log2(mc@mc_fp[g2,x]))*)   
+
+```{r, eval=TRUE,warning=FALSE}
+marks_colors = read.delim("annotations/mc_colorize.txt", sep="\t", stringsAsFactors=F)
+kable(marks_colors)
+```
+
+
+Applying this table to color metacells is done using the command mc_colorize as shown below.   
+@param *new_mc_id* output metacell id in scdb      
+@param *mc_id input* metacell id in scdb   
+@param *marker_color* a data frame with fields gene, group, color, priority, thresh  
+@param *override* if this is true, all colors are going to be set to white unless some marker match is found  
+
+```{r, eval=TRUE, warning=FALSE}
+mc_colorize(new_mc_id = id, mc_id = id, marker_colors=marks_colors,override=T)
+```
+
+We are now equipped with some basic coloring of metacells, which can also be accessed directly:  
+
+```{r, eval=TRUE, warning=FALSE}
+mc = scdb_mc(id)
+table(mc@colors)
+```
+
+### Visualizing the MC confusion matrix in order to colorize the metacells
+
+While 2D projections are popular and intuitive (albeit sometimes misleading) ways to visualize scRNA-seq results, we can also summarize the similarity structure among metacells using a "confusion matrix" which encodes the pairwise similarities between all metacells.  
+This matrix may capture hierarchical structures or other complex organizations among metacells.   
+
+We first create a hierarchical clustering of metacells, based on the number of similarity relations between their cells:  
+
+```{r, eval=TRUE, warning=FALSE}
+set.seed(27)
+mc_hc = mcell_mc_hclust_confu(mc_id=id,graph_id=id)
+```
+
+Next, we generate clusters of metacells based on this hierarchy, and visualize the confusion matrix and these clusters.  
+The confusion matrix is shown at the bottom, and the top panel encodes the cluster hierarchy (subtrees in blue, sibling subtrees in gray):  
+
+```{r, eval=TRUE, warning=FALSE}
+set.seed(27)
+mc_sup = mcell_mc_hierarchy(mc_id=id,mc_hc=mc_hc, T_gap=0.04)
+save(file="saved_work/mc_hc_sup.Rda",mc_hc,mc_sup)
+```
+
+```{r, eval=TRUE, warning=FALSE}
+mcell_mc_plot_hierarchy(mc_id=id,graph_id=id,mc_order=mc_hc$order,sup_mc = mc_sup,width=3500, height=3500, min_nmc=2)
+```
+`r sprintf("![confusion matrix](%s){width=1000px}", paste0("results/",id,".supmc_confu.png"))`
+
+After exploring the confusion matrix, we would like to remove mc 269 because it doesn't have a significant signature of any relevant cell type.
+We would like also to define sup 128 and 142 as a super MCs of Monocytes, 148 as a super MC of Macrophages type III and 171 as a super MC of Macrophages type II
+It is a little bit challenging to find the "correct" marker genes, thresholds and priority in order to apply with the simple mc_colorize function.  
+So we can update it manually:
+
+```{r, eval=TRUE, warning=FALSE}
+ord_id = paste0(id,"_sorted")
+mc = scdb_mc(id)
+scdb_add_mc(id = paste0(id,"_pre_f"),mc = mc)
+good_cells = names(mc@mc[mc@mc!=269])
+mc@mc = mc@mc[good_cells]
+mc@cell_names = good_cells
+mc@mc_fp = mc@mc_fp[,-269]
+mc@e_gc = mc@e_gc[,-269]
+mc@cov_gc = mc@cov_gc[,-269]
+mc@n_bc = mc@n_bc[,-269]
+mc@annots = mc@annots[which(names(mc@annots)!=269)]
+mc@colors = mc@colors[-269]
+mc@colors[mc_sup[[128]]$mcs] = "#59B56F"
+mc@colors[mc_sup[[142]]$mcs] = "#59B56F"
+mc@colors[mc_sup[[148]]$mcs] = "#0E431F"
+mc@colors[mc_sup[[171]]$mcs] = "#118437"
+mat = scdb_mat(id)
+mcell_mat_ignore_cells(ord_id,id,ig_cells = good_cells,reverse = T)
+scdb_add_mc(id = ord_id,mc = mc)
+cgraph = scdb_cgraph(id)
+cgraph@cell_names = cgraph@cell_names[cgraph@cell_names %in% good_cells]
+cgraph@edges = cgraph@edges[cgraph@edges$mc1 %in% good_cells & cgraph@edges$mc2 %in% good_cells,]
+cgraph@nodes = cgraph@nodes[cgraph@nodes %in% good_cells]
+scdb_add_cgraph(ord_id,cgraph)
+sc_coc = scdb_coclust(id)
+sc_coc@coclust = sc_coc@coclust[sc_coc@coclust$node1 %in% good_cells & sc_coc@coclust$node2 %in% good_cells,]
+sc_coc@n_samp = sc_coc@n_samp[names(sc_coc@n_samp) %in% good_cells]
+scdb_add_coclust(ord_id,sc_coc)
+```
+
+Re-running the hierarchial clustering for further use 
+```{r, eval=TRUE, warning=FALSE}
+set.seed(27)
+mc_hc = mcell_mc_hclust_confu(mc_id=ord_id,graph_id=ord_id)
+set.seed(27)
+mc_sup = mcell_mc_hierarchy(mc_id=ord_id,mc_hc=mc_hc, T_gap=0.04)
+save(file="saved_work/mc_hc_sup_f.Rda",mc_hc,mc_sup)
+mcell_mc_plot_hierarchy(mc_id=ord_id,graph_id=ord_id,mc_order=mc_hc$order,sup_mc = mc_sup,width=3500, height=3500, min_nmc=2)
+```
+`r sprintf("![confusion matrix](%s){width=1000px}", paste0("results/",ord_id,".supmc_confu.png"))`
+
+### Re ordering our mc object
+We want to re order the metacells by the new hierarchial clusering order
+```{r, eval=TRUE, warning=FALSE}
+mc = scdb_mc(ord_id)
+load("saved_work/mc_hc_sup_f.Rda")
+lin_ord = c("Endothel","Fibro","Matrix","Smooth","Pericytes","Epithel","AT1","AT2","Club","Ciliated","MacI","MacII","MacIII","Mon","Neut", "Baso", "Mast","DC","B", "T", "ILC","NK")
+fac = mc@colors[mc_hc$order]
+names(fac) = mc_hc$order
+color_key = unique(mc@color_key[,c("group","color")])
+name2color = color_key$color
+names(name2color) = color_key$group
+fac = sort(factor(fac,levels = name2color[lin_ord]))
+mc_ord = as.integer(names(fac))
+sorted_mc = mc_reorder(mc,mc_ord)
+scdb_add_mc(id=ord_id,mc = sorted_mc)
+mc = scdb_mc(ord_id)
+```
+
+## A comprehensive map of the lung cell types during development  
+
+### Projecting metacells and cells in 2D
+
+We may want to visualize the similarity structure among metacells (or among cells within metacells).  
+We construct a 2D projection of the metacells, and use it to plot the metacells and key similarities between them (shown as connecting edges), as well as the cells. This plot will use the same metacell coloring we established before.  
+
+```{r, eval=TRUE, warning=FALSE}
+# source(src_functions)
+scfigs_init("results/figure1")
+tgconfig::override_params("annotations/lung_params.yaml","metacell")
+set.seed(27)
+mcell_mc2d_force_knn(mc2d_id= ord_id,mc_id=ord_id, graph_id=ord_id)
+mc2d = scdb_mc2d(ord_id)
+new_mc_y = mc2d@mc_y
+new_mc_y[212:268] = new_mc_y[212:268] + 25
+new_mc_y[30] = new_mc_y[29] + 60
+new_mc_y[246] = new_mc_y[245]
+new_mc_y[245] = new_mc_y[245] + 25
+xy_df = data.frame(mc_x = mc2d@mc_x, mc_y = new_mc_y)
+mcell_mc2d_force_knn_on_cells(mc2d_id = ord_id,mc_id = ord_id,graph_id = ord_id,mc_xy = xy_df)
+tgconfig::set_param("mcell_mc2d_width",2200, "metacell")
+tgconfig::set_param("mcell_mc2d_height",2000, "metacell")
+# local_mcell_mc2d_plot(mc2d_id=ord_id,plot_edges = T)  
+mcell_mc2d_plot(mc2d_id=ord_id,plot_edges = T)  
+scfigs_init("results/")
+```
+Note that we changed the metacell parameters "mcell_mc2d_height/width" to get a reasonably-sized figure.    
+
+We created a two-dimensional projection of 21033 single cells from 17 mice from all time points were analyzed. 268 metacells were associated with 22 cell types and states, annotated, and marked by color code.
+
+`r sprintf("![2d projection of single cells onto a graph representation](%s){width=1000px}", paste0("results/figure1/",ord_id,".2d_graph_proj.png"))`
+
+### Creating a heatmap of genes and metacells
+
+We can use the colors to produce a labeled heatmap, showing selected genes and their distributions over metacells, with the colored annotation shown at the bottom:  
+
+```{r, eval=TRUE, warning=FALSE}
+mcell_gset_from_mc_markers(gset_id=paste0(ord_id,"_markers"), mc_id=ord_id)
+mcell_mc_plot_marks(mc_id=ord_id, gset_id=paste0(ord_id,"_markers"), mat_id=ord_id,plot_cells=TRUE)
+```
+`r sprintf("![heatmap_marks_after_colorizing](%s){width=1000px}", paste0("results/",ord_id,".cells_heat_marks.png"))`
+
+We would like to create another heatmap:  
+We order the metacells by their kinetic group, then choose marker genes by a predefined list and the top 10 genes in each metacell 
+```{r, eval=TRUE, warning=FALSE}
+tgconfig::override_params("annotations/lung_params.yaml","metacell")
+source(src_functions)
+ord_id = paste0(id,"_sorted")
+mc = scdb_mc(ord_id)
+mat = scdb_mat(ord_id)
+lfp = log2(mc@mc_fp)
+cell_stats = mat@cell_metadata[names(mc@mc),]
+lin_markers = c("Ccl5","Trbc2","Cd19","Retnlg","Mcpt8","Mcpt4","F13a1","Ear2","Epcam","Cdh5","Col1a2","Akap5","Lamp3","Scgb3a2","Foxj1","Enpp2","Mfap4","Gucy1a3")
+lin_ord = c("Endothel","Fibro","Matrix","Smooth","Pericytes","Epithel","AT1","AT2","Club","Ciliated","MacI","MacII","MacIII","Mon","Neut", "Baso", "Mast","DC","B", "T", "ILC","NK")
+tp_cols = c("bisque", "lightgoldenrod1", "gold", "chocolate2", "coral3", "brown3", "indianred4")
+tps = factor(cell_stats$kinetic.group, levels = c("E12.5", "E16.5", "E_late", "P_early", "P_mid", "P_d2", "P_d7"))
+names(tps) = rownames(cell_stats)
+color_key = unique(mc@color_key[,c("group","color")])
+color2name = color_key$group
+names(color2name) = color_key$color
+
+nms = choose_genes_from_mc(mc = mc, mat = mat, nms_per_mc = 10,nms_thresh = 2)
+tp_dist = table(tps %in% c("E12.5", "E16.5", "E_late"), mc@mc)
+dist_n = tp_dist / rowSums(tp_dist)
+mc_names = color2name[mc@colors]
+names(mc_names) = 1:length(mc@colors)
+
+clust_ord = as.integer(unlist(tapply(1:length(mc@colors),factor(mc_names,levels = lin_ord) , function(x) if(length(x) == 1){return(x);} else{return(as.integer(names(sort((dist_n[1,x] > dist_n[2,x])/length(x)))))})))
+mc_ord = factor(1:length(mc@colors),levels = clust_ord)
+
+nms = choose_genes_from_mc(mc = mc, mat = mat, good_mcs = clust_ord,nms_per_mc = 5,nms_thresh = 3, max_num = 80, bad_genes = bad_marks, ord= "max.col", must_haves = union(lin_markers,mc@color_key$gene))
+gene_set = rep(1,length(nms))
+names(gene_set) = rev(nms)
+man_gset = gset_new_gset(gene_set,"manual_gset_markers")
+scdb_add_gset(id = paste0(ord_id,"_man_markers"),gset = man_gset)
+
+if(!dir.exists("results/figureS1")) dir.create("results/figureS1/")
+heatmap_tp(mc_id = ord_id,gset_id = paste0(ord_id,"_man_markers"),mat_id = ord_id,fig_fn ="results/figureS1/heatmap_by_tp.png",mc_ord = clust_ord,tps = tps,tp_cols = tp_cols)
+```
+We created a heatmap for gene expression of key markers across single cells from both immune and non-immune compartments.  
+Lower panels indicate association to cell type (color bars represent cell type), and developmental time-point of each single cell. 
+
+![heatmap_marks_by_time_points](results/figureS1/heatmap_by_tp.png){width=1000px}
+
+
+### 2D projection by Genes
+Expression quantiles of key cell-type-specific marker genes on top of the 2D map of lung development.  
+```{r, eval=TRUE, warning=FALSE}
+tgconfig::override_params("annotations/lung_params.yaml","metacell")
+lin_markers = c("Ccl5","Trbc2","Cd19","Retnlg","Mcpt8","Mcpt4","F13a1","Ear2","Epcam","Cdh5","Col1a2","Akap5","Lamp3","Scgb3a2","Foxj1","Enpp2","Mfap4","Gucy1a3")
+b = 9
+mat = scdb_mat(ord_id)
+mc2d = scdb_mc2d(ord_id)
+palette = c("white", "cornsilk1", "orange","red3", "purple4", "midnightblue")
+ny = ceiling(length(lin_markers)/6)
+nx = 6
+png("results/figure1/genes_2dproj.png",w=4200,h=(4200/nx) * ny)
+layout(matrix(1:(nx*ny), ny , nx , byrow=T))
+for (val in lin_markers) {
+  vals = as.matrix(mat@mat)[val,]
+  norm_val = rep(1, length(vals))
+  names(norm_val) = names(vals)
+  norm_val[ vals != 0] = as.numeric(cut(vals[ vals != 0], unique(quantile(vals[ vals != 0], (0:b)/b)), include.lowest = T)) + 1
+  cols = colorRampPalette(palette)(max(norm_val))
+  par(mar=c(0.5,0.5,3,0.5),xpd=TRUE)
+  plot(mc2d@sc_x, mc2d@sc_y, pch = 20, col = "gray80", cex=1, axes = F, xlab = "", ylab = "")
+	exp_cells = names(which(vals > 0))
+	points(mc2d@sc_x[exp_cells], mc2d@sc_y[exp_cells], cex = 1 + 0.4 * round((norm_val[exp_cells] - 1) / max(norm_val) * 5),pch = 21, bg = cols[norm_val[exp_cells]])
+	title(main=val, cex.main=3.6)
+}
+dev.off()
+```
+![Genes 2D distribution](results/figure1/genes_2dproj.png){width=1000px}  
+
+### Coculstering
+Log values of the co-clustering structure of both compartments, as assessed by bootstrapping analysis. Color bars represent cell types.
+
+```{r, eval=TRUE, warning=FALSE}
+tgconfig::override_params("annotations/lung_params.yaml","metacell")
+mcp_heatmap_text_cex = tgconfig::get_param("mcp_heatmap_text_cex",package = "metacell")
+mcp_2d_legend_cex = tgconfig::get_param("mcell_mc2d_legend_cex",package = "metacell")
+sc_coc = scdb_coclust(ord_id)
+mc = scdb_mc(ord_id)
+X = sc_coc@coclust
+Y = matrix(0,  length(mc@mc), length(mc@mc), dimnames = list(names(mc@mc), names(mc@mc)))
+Y[cbind(as.vector(X$node1), as.vector(X$node2))] = X$cnt
+lin_ord = c("Endothel","Fibro","Matrix","Smooth","Pericytes","Epithel","AT1","AT2","Club","Ciliated","MacIII","MacII","MacI","Mon","DC", "Neut", "Baso", "Mast", "B", "T", "NK", "ILC")
+color_key = unique(mc@color_key[,c("group","color")])
+name2color = color_key$color
+names(name2color) = color_key$group
+color2name = color_key$group
+names(color2name) = color_key$color
+
+lung_names = as.character(color2name[mc@colors])
+names(lung_names) = 1:length(lung_names)
+clust_ord = as.integer(names(sort(factor(lung_names, levels = lin_ord))))
+cell_ord = names(mc@mc[ order(factor(mc@mc, levels = clust_ord))])
+IM = Y[cell_ord, cell_ord]
+coc_shades = colorRampPalette(c("white", "gold", "orange2", "tomato3", "red4", "purple4", "black"))(1000)
+IM = pmax(IM, t(IM))
+if(!dir.exists("results/figureS1")) dir.create("results/figureS1/")
+png("results/figureS1/coclustering.png", height = 2000, width = 2200)
+par(mar = rep(0.5,4), fig = c(0.05,0.85,0.05,1),xpd=TRUE)
+image(log(1 + IM), col = coc_shades, axes = F)
+cls = cumsum(table(factor( mc@mc, levels = clust_ord))) / length(mc@mc)
+cls_wide = cumsum(table(factor( color2name[mc@colors[mc@mc]], levels = lin_ord))) / length(mc@mc)
+abline(h = cls, v = cls, lty = 2, lwd = 1, col = "gray20")
+abline(h = cls_wide, v = cls_wide, lty = 1, lwd = 2, col = "black")
+par(mar = rep(0.5,4), fig = c(0,0.05,0.05,1), new = T)
+image(t(matrix(as.numeric(factor(lung_names[as.integer(mc@mc[colnames(IM)])], levels = lin_ord)))), axes = F, 
+	col = name2color[lin_ord], zlim = c(1, length(lin_ord)))
+par(mar = rep(0.5,4), fig = c(0.05,0.85,0,0.05), new = T)
+image(matrix(as.numeric(factor(lung_names[as.integer(mc@mc[colnames(IM)])], levels = lin_ord))), axes = F, 
+	col = name2color[lin_ord], zlim = c(1, length(lin_ord)))
+par(mar = c(1,3,1,10), fig = c(0.85,1,0.05,0.3),new = T)
+image(t(matrix(1:100)), axes = F, col = coc_shades)
+mtext(as.integer(min(log(1 + IM))),side=1,at = 0.25,las = 1,line=1, cex=mcp_heatmap_text_cex+2)
+mtext(as.integer(max(log(1 + IM))),side=3,at = 0.25,las = 1,line=1, cex=mcp_heatmap_text_cex+2)
+mtext("log co-clustering",side = 4, at = 0.5, cex=mcp_heatmap_text_cex + 2, line = 3)
+par(mar = rep(2,4), fig = c(0.85,1,0.3,1),new = T)
+legend("topleft", legend = as.character(color2name), pch = 22, cex = mcp_2d_legend_cex + 2,pt.cex = mcp_2d_legend_cex + 4, pt.bg = names(color2name),col="black", bty = "n")
+dev.off()
+
+```
+![Coclustering](results/figureS1/coclustering.png){width=1000px}

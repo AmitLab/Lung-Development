@@ -1,0 +1,13 @@
+---
+title: "Lung development - scripts and more"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Lung development MetaCell construction and Ligand-Receptor analysis 
+In this site we exemplify the application of metacell package to the lung development dataset, obtained using the MARS-seq protocol, and the Ligand-Receptor analysis ([Cohen et al. Cell 2018](https://www.cell.com/cell/pdf/S0092-8674(18)31181-4.pdf)).
+Source code is available [here](https://github.com/DiklaGelbard/Lung-Development).  
+
+For further questions please contact [Amir Giladi](mailto:aygoldberg@gmail.com) or [Dikla Glebard Solodkin](mailto:dikla.gelbard@gmail.com)
